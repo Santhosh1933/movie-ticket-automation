@@ -1,6 +1,10 @@
+import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
+
 from dotenv import load_dotenv
+from fastapi import FastAPI
 from supabase import Client, create_client
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -30,7 +34,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Telegram Bot Token
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# Pre-defined Theaters List (Includes "ALL" option)
+# Pre-defined Theaters List
 THEATERS = {
     "ALL": "🌟 ALL THEATERS",
     "CD1020778": "INOX Marina Mall, Egatoor",
@@ -41,6 +45,9 @@ THEATERS = {
 # Conversation States
 SELECT_THEATER, ENTER_MOVIE, ENTER_PRICES, ENTER_TIMES, ENTER_NTFY = range(5)
 EDIT_FIELD_SELECT, EDIT_PRICES, EDIT_TIMES, EDIT_NTFY = range(5, 9)
+
+# Global Telegram Application Reference
+telegram_app: Application = None
 
 # ---------------------------------------------------------------------------
 # Core Menu Handlers
@@ -474,13 +481,9 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
-# App Runner
+# Telegram Application Setup
 # ---------------------------------------------------------------------------
-def main():
-    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        print("CRITICAL ERROR: Please add your TELEGRAM_BOT_TOKEN!")
-        return
-
+def build_telegram_app() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     create_conv = ConversationHandler(
@@ -527,9 +530,40 @@ def main():
     app.add_handler(create_conv)
     app.add_handler(edit_conv)
 
-    print("🤖 Telegram Bot active with 'ALL' Theater and 'ALL' Movie support...")
-    app.run_polling()
+    return app
+
+# ---------------------------------------------------------------------------
+# FastAPI Lifecycle & Web Endpoints
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global telegram_app
+    logger.info("Starting up FastAPI web server & Telegram Bot...")
+    
+    telegram_app = build_telegram_app()
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.updater.start_polling()
+    
+    yield  # Web server operates normally here
+    
+    logger.info("Shutting down Telegram Bot...")
+    await telegram_app.updater.stop()
+    await telegram_app.stop()
+    await telegram_app.shutdown()
+
+
+app = FastAPI(title="Movie Alert Bot Server", lifespan=lifespan)
+
+
+@app.get("/")
+@app.get("/health")
+def health_check():
+    """Render HTTP Ping endpoint so Render service stays active."""
+    return {"status": "ok", "service": "Telegram Bot active"}
 
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("bot:app", host="0.0.0.0", port=port, reload=False)

@@ -24,6 +24,9 @@ logger = logging.getLogger("DistrictModalWorker")
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
+# In-memory alert cache to prevent sending duplicate notifications for the same session
+NOTIFIED_SESSIONS = set()
+
 # ---------------------------------------------------------------------------
 # 2. District API Configurations & Theater Map
 # ---------------------------------------------------------------------------
@@ -59,7 +62,7 @@ THEATERS_URL_MAP = {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Utility Functions
+# 3. Utility Functions & Accurate Seat Extractor from main.py
 # ---------------------------------------------------------------------------
 def parse_to_ist(show_time_str: str) -> datetime:
     clean_str = show_time_str.replace("Z", "")
@@ -96,20 +99,87 @@ def fetch_cinema_upstream(cinema_url):
     return json.loads(match.group(1))
 
 
-def extract_available_seats(seat_layout_res):
+def extract_price_breakdown(seat_layout_res):
+    """Accurate seat availability parser ported directly from main.py."""
+    available_by_price = defaultdict(list)
+    total_by_price = defaultdict(int)
+
+    fallback_price_map = {}
+    sessions_meta = seat_layout_res.get("cinemaInfo", {}).get("sessions", [])
+    if sessions_meta and isinstance(sessions_meta, list):
+        for area_summary in sessions_meta[0].get("areas", []):
+            code = area_summary.get("code")
+            price = area_summary.get("price")
+            if code and price is not None:
+                fallback_price_map[str(code).upper()] = float(price)
+
     areas = seat_layout_res.get("seatLayout", {}).get("colAreas", {}).get("objArea", [])
-    seats_by_price = defaultdict(int)
-    total_avail = 0
 
     for area in areas:
-        for row in area.get("objRow", []):
-            for seat in row.get("objSeat", []):
-                if str(seat.get("SeatStatus")) == "0":
-                    price = float(seat.get("price") or area.get("AreaPrice") or 0.0)
-                    seats_by_price[price] += 1
-                    total_avail += 1
+        area_code = str(area.get("AreaCode") or area.get("AreaDesc") or "").upper()
 
-    return total_avail, seats_by_price
+        default_price = area.get("AreaPrice")
+        if default_price is None:
+            default_price = fallback_price_map.get(area_code, 0.0)
+        else:
+            default_price = float(default_price)
+
+        default_desc = area.get("AreaDesc") or area_code or "STANDARD"
+        overrides = area.get("overrideSeatCategory") or []
+
+        for row in area.get("objRow", []):
+            row_id = row.get("PhyRowId", "")
+            for seat in row.get("objSeat", []):
+                grid_num = seat.get("GridSeatNum")
+                seat_num = seat.get("displaySeatNumber", "")
+                seat_label = f"{row_id}{seat_num}"
+                status = str(seat.get("SeatStatus"))
+
+                price = default_price
+                category = default_desc
+
+                if seat.get("price") is not None:
+                    price = float(seat.get("price"))
+
+                if grid_num is not None and isinstance(overrides, list):
+                    for ov in overrides:
+                        start = ov.get("GridSeatNumStart")
+                        end = ov.get("GridSeatNumEnd")
+                        if start is not None and end is not None and start <= grid_num <= end:
+                            if ov.get("AreaPrice") is not None:
+                                price = float(ov.get("AreaPrice"))
+                            category = ov.get("AreaDesc") or ov.get("AreaCode") or category
+                            break
+
+                final_price = float(price) if price is not None else 0.0
+                key = (final_price, str(category))
+
+                total_by_price[key] += 1
+                if status == "0":
+                    available_by_price[key].append(seat_label)
+
+    breakdown = []
+    total_avail = 0
+
+    all_keys = sorted(
+        set(list(available_by_price.keys()) + list(total_by_price.keys())),
+        key=lambda x: (x[0] if x[0] is not None else 0.0, str(x[1])),
+    )
+
+    for price, category in all_keys:
+        seats = available_by_price.get((price, category), [])
+        avail_count = len(seats)
+        total_avail += avail_count
+        if avail_count > 0:
+            breakdown.append(
+                {
+                    "category": category,
+                    "price": price,
+                    "available_count": avail_count,
+                }
+            )
+
+    return total_avail, breakdown
 
 
 def dispatch_notifications(user_alert, session_info, theater_name, movie_title, telegram_bot_token):
@@ -151,16 +221,15 @@ def dispatch_notifications(user_alert, session_info, theater_name, movie_title, 
     if ntfy_topic:
         ntfy_url = f"https://ntfy.sh/{ntfy_topic}"
         title_text = f"TICKET ALERT: {movie_title}"
-        message_text = f"{movie_title} tickets are live at {theater_name}! ({avail_seats} seats left)"
-        
+        message_text = f"{movie_title} tickets live at {theater_name}! ({avail_seats} seats left)"
         try:
             requests.post(
                 ntfy_url,
-                data=message_text.encode("utf-8"),  # Encode body as UTF-8 bytes
+                data=message_text.encode("utf-8"),
                 headers={
-                    "Title": title_text.encode("utf-8"),  # Encode title header as UTF-8 bytes
-                    "Priority": "5",                      # Priority 5 breaks through DND mode
-                    "Tags": "ticket,rotating_light,popcorn",  # ntfy renders 'rotating_light' tag as 🚨
+                    "Title": title_text.encode("utf-8"),
+                    "Priority": "5",
+                    "Tags": "ticket,rotating_light",
                 },
                 timeout=10,
             )
@@ -179,9 +248,13 @@ def run_worker_cycle():
 
     load_dotenv()
 
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_KEY")
-    telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    supabase_url = os.environ.get("SUPABASE_URL", "https://imrvfqbadzhtzfrsmcff.supabase.co")
+    supabase_key = os.environ.get("SUPABASE_KEY")
+    telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+
+    if not supabase_key or not telegram_bot_token:
+        logger.critical("Missing required environment variables (SUPABASE_KEY / TELEGRAM_BOT_TOKEN) in Modal Secrets.")
+        return
 
     supabase: Client = create_client(supabase_url, supabase_key)
 
@@ -202,7 +275,6 @@ def run_worker_cycle():
 
     logger.info(f"Loaded {len(active_alerts)} active user monitor rules.")
 
-    # Expand rules across all theaters if theater_id == "ALL"
     expanded_rules_by_theater = defaultdict(list)
     all_theater_ids = list(THEATERS_URL_MAP.keys())
 
@@ -241,14 +313,10 @@ def run_worker_cycle():
                 content_id = str(m_data.get("contentId") or movie_entry.get("entityCode"))
                 sessions = movie_entry.get("sessions", [])
 
-                logger.info(f"  📽️ Movie: '{scraped_movie_title}' ({len(sessions)} total sessions scheduled)")
-
                 for rule in user_rules:
                     rule_movie = rule["movie_name"].strip()
 
-                    # Filter 1: Check Movie match OR "ALL" wildcard match
                     if rule_movie.upper() != "ALL" and rule_movie.lower() not in scraped_movie_title.lower():
-                        logger.debug(f"    ⏭️ Skipping movie '{scraped_movie_title}' (Rule target: '{rule_movie}')")
                         continue
 
                     for sess in sessions:
@@ -264,21 +332,24 @@ def run_worker_cycle():
 
                         time_display = session_dt_ist.strftime("%I:%M %p (%d %b)")
 
-                        # Filter 2: Ignore past shows
+                        # Filter 1: Drop past shows
                         if session_dt_ist <= now_ist:
-                            logger.info(f"    ⏳ [Session {sid} @ {time_display}] SKIPPED: Show time already passed (Current time: {now_ist.strftime('%I:%M %p')})")
                             continue
 
-                        # Filter 3: Check Time Window Range
+                        # Filter 2: Time Window check
                         rule_start_t = time.fromisoformat(rule["start_time"])
                         rule_end_t = time.fromisoformat(rule["end_time"])
                         session_t = session_dt_ist.time()
 
                         if not (rule_start_t <= session_t <= rule_end_t):
-                            logger.info(f"    🕒 [Session {sid} @ {time_display}] SKIPPED: Outside rule time window ({rule_start_t}-{rule_end_t})")
                             continue
 
-                        # Construct API layout payload
+                        # Dedup Check
+                        session_key = f"{rule['id']}_{sid}"
+                        if session_key in NOTIFIED_SESSIONS:
+                            logger.info(f"    ⏭️ [Session {sid} @ {time_display}] Already notified user previously. Skipping.")
+                            continue
+
                         fmt_code = sess.get("entityDataCode") or sess.get("fid", "").lower()
                         payload = {
                             "cinemaId": int(sess.get("cid", cinema_id)),
@@ -310,26 +381,25 @@ def run_worker_cycle():
                             )
                             res_json = json.loads(res_text)
 
-                            tot_avail, seats_by_price = extract_available_seats(res_json)
+                            tot_avail, breakdown = extract_price_breakdown(res_json)
 
                             if tot_avail <= 0:
-                                logger.info(f"    🔴 [Session {sid} @ {time_display}] SKIPPED: 0 available seats found.")
+                                logger.info(f"    🔴 [{scraped_movie_title} @ {time_display}] 0 open seats available.")
                                 continue
 
                             min_p = float(rule["min_price"])
                             max_p = float(rule["max_price"])
 
-                            valid_seats = {
-                                p: count
-                                for p, count in seats_by_price.items()
-                                if min_p <= p <= max_p
-                            }
+                            valid_tiers = [
+                                b for b in breakdown
+                                if min_p <= float(b["price"]) <= max_p and b["available_count"] > 0
+                            ]
 
-                            if not valid_seats:
-                                logger.info(f"    💵 [Session {sid} @ {time_display}] SKIPPED: Seats exist ({tot_avail}), but outside price range ₹{min_p}-₹{max_p}")
+                            if not valid_tiers:
+                                logger.info(f"    💵 [{scraped_movie_title} @ {time_display}] Seats exist ({tot_avail}), but outside price range ₹{min_p}-₹{max_p}")
                                 continue
 
-                            lowest_price = min(valid_seats.keys())
+                            lowest_price = min(b["price"] for b in valid_tiers)
 
                             session_info = {
                                 "session_id": sid,
@@ -339,8 +409,9 @@ def run_worker_cycle():
                                 "lowest_price": lowest_price,
                             }
 
-                            logger.info(f"    🎯 MATCH FOUND! Sending notification for '{scraped_movie_title}' @ {time_display} (Seats: {tot_avail}, Lowest Price: ₹{lowest_price})")
+                            logger.info(f"    🎯 MATCH FOUND! Dispatched for '{scraped_movie_title}' @ {time_display} (Seats: {tot_avail}, Starting Price: ₹{lowest_price})")
                             dispatch_notifications(rule, session_info, cinema_name, scraped_movie_title, telegram_bot_token)
+                            NOTIFIED_SESSIONS.add(session_key)
 
                         except Exception as e:
                             logger.error(f"    ❌ Error querying layout for session {sid}: {e}")
@@ -352,7 +423,7 @@ def run_worker_cycle():
 
 
 # ---------------------------------------------------------------------------
-# 5. Modal App Setup & Cron Deployment
+# 5. Modal Container Setup (With tele-scheduler secret)
 # ---------------------------------------------------------------------------
 app_image = (
     modal.Image.debian_slim()
@@ -366,6 +437,7 @@ app = modal.App("district-ticket-worker")
 @app.function(
     image=app_image,
     schedule=modal.Cron("*/1 * * * *"),
+    secrets=[modal.Secret.from_name("tele-scheduler")],
     timeout=55,
 )
 def scheduled_ticket_check():
